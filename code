@@ -1,0 +1,269 @@
+#include <AFMotor.h>
+#include <SoftwareSerial.h>
+
+// ── Bluetooth (HC-05) ─────────────────────────────────────────────────────────
+// HC-05 TX  →  Arduino pin 2  (RX of SoftwareSerial)
+// HC-05 RX  →  Arduino pin 3  via 1kΩ/2kΩ voltage divider  (TX of SoftwareSerial)
+SoftwareSerial BTSerial(2, 3);  // RX, TX
+
+// ── Motors ───────────────────────────────────────────────────────────────────
+AF_DCMotor motor1(3);
+AF_DCMotor motor2(4);
+AF_DCMotor motor3(1);
+AF_DCMotor motor4(2);
+
+// ── IR Sensors ───────────────────────────────────────────────────────────────
+const int ir_forward_left    = A0;
+const int ir_forward_right   = A1;
+const int ir_backward_left   = A2;
+const int ir_backward_right  = A3;
+
+// ── Push-button Switches (INPUT_PULLUP — pressed = LOW) ──────────────────────
+const int forward_switch  = A4;
+const int backward_switch = A5;
+
+// ── Ultrasonic Sensors ───────────────────────────────────────────────────────
+const int forward_us_trigger  = 9;
+const int forward_us_echo     = 10;
+const int backward_us_trigger = 8;
+const int backward_us_echo    = 13;
+
+// ── Sensor readings ──────────────────────────────────────────────────────────
+int ir_forward_left_val  = LOW;
+int ir_forward_right_val = LOW;
+int ir_backward_left_val  = LOW;
+int ir_backward_right_val = LOW;
+int forward_switch_val  = LOW;
+int backward_switch_val = LOW;
+
+// ── Control Mode ─────────────────────────────────────────────────────────────
+// SOURCE_AUTO   : IR line-following + obstacle avoidance (physical switches)
+// SOURCE_BT     : Full manual control from Android app
+enum ControlSource { SOURCE_AUTO, SOURCE_BT };
+ControlSource controlSource = SOURCE_AUTO;
+
+bool is_forward  = false;
+bool is_backward = false;
+
+// ── Motor speed (adjustable via Bluetooth) ───────────────────────────────────
+int motorSpeed = 200;  // 0–255
+
+// ─────────────────────────────────────────────────────────────────────────────
+void setup() {
+  pinMode(ir_forward_left,    INPUT);
+  pinMode(ir_forward_right,   INPUT);
+  pinMode(ir_backward_left,   INPUT);
+  pinMode(ir_backward_right,  INPUT);
+  pinMode(forward_switch,     INPUT_PULLUP);
+  pinMode(backward_switch,    INPUT_PULLUP);
+  pinMode(forward_us_trigger,  OUTPUT);
+  pinMode(forward_us_echo,     INPUT);
+  pinMode(backward_us_trigger, OUTPUT);
+  pinMode(backward_us_echo,    INPUT);
+
+  Serial.begin(9600);
+  BTSerial.begin(9600);   // Must match HC-05 baud rate (default 9600)
+  Serial.println("Robot ready. Waiting for commands...");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+void loop() {
+  // ── 1. Handle incoming Bluetooth commands ──────────────────────────────────
+  if (BTSerial.available()) {
+    handleBluetooth(BTSerial.read());
+  }
+
+  // ── 2. Handle physical switches (always active, override BT mode) ──────────
+  forward_switch_val  = digitalRead(forward_switch);
+  backward_switch_val = digitalRead(backward_switch);
+
+  if (forward_switch_val == LOW) {
+    controlSource = SOURCE_AUTO;
+    is_forward  = !is_forward;
+    is_backward = false;
+    delay(300);
+    Serial.println("FRONT_Switch");
+    BTSerial.println("MODE:AUTO_FWD");
+  }
+  if (backward_switch_val == LOW) {
+    controlSource = SOURCE_AUTO;
+    is_backward = !is_backward;
+    is_forward  = false;
+    delay(300);
+    Serial.println("BACK_Switch");
+    BTSerial.println("MODE:AUTO_BWD");
+  }
+
+  // ── 3. Execute motion based on active control source ───────────────────────
+  if (controlSource == SOURCE_AUTO) {
+    runAutoMode();
+  }
+  // Bluetooth mode: commands are handled immediately in handleBluetooth()
+  // so no additional logic is needed here.
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BLUETOOTH COMMAND HANDLER
+//
+// Command map (single ASCII character):
+//   F  – Move forward
+//   B  – Move backward
+//   L  – Turn left
+//   R  – Turn right
+//   S  – Stop
+//   0–9 – Set speed (0=low … 9=max, mapped to 80–255)
+//   A  – Switch to Auto (IR + ultrasonic) mode
+//   M  – Switch to Manual (Bluetooth) mode
+// ─────────────────────────────────────────────────────────────────────────────
+void handleBluetooth(char cmd) {
+  Serial.print("BT CMD: ");
+  Serial.println(cmd);
+
+  // Speed adjustment (digits 0–9)
+  if (cmd >= '0' && cmd <= '9') {
+    motorSpeed = map(cmd - '0', 0, 9, 80, 255);
+    BTSerial.print("SPEED:");
+    BTSerial.println(motorSpeed);
+    return;
+  }
+
+  switch (cmd) {
+    case 'F':
+      controlSource = SOURCE_BT;
+      if (!checkObstacle(forward_us_trigger, forward_us_echo)) {
+        setMotorDirection(FORWARD, FORWARD);
+        BTSerial.println("MOVE:FWD");
+      } else {
+        stopMotors();
+        BTSerial.println("BLOCKED:FWD");
+      }
+      break;
+
+    case 'B':
+      controlSource = SOURCE_BT;
+      if (!checkObstacle(backward_us_trigger, backward_us_echo)) {
+        setMotorDirection(BACKWARD, BACKWARD);
+        BTSerial.println("MOVE:BWD");
+      } else {
+        stopMotors();
+        BTSerial.println("BLOCKED:BWD");
+      }
+      break;
+
+    case 'L':
+      controlSource = SOURCE_BT;
+      setMotorDirection(BACKWARD, FORWARD);
+      BTSerial.println("MOVE:LEFT");
+      break;
+
+    case 'R':
+      controlSource = SOURCE_BT;
+      setMotorDirection(FORWARD, BACKWARD);
+      BTSerial.println("MOVE:RIGHT");
+      break;
+
+    case 'S':
+      controlSource = SOURCE_BT;
+      stopMotors();
+      BTSerial.println("MOVE:STOP");
+      break;
+
+    case 'A':
+      controlSource = SOURCE_AUTO;
+      is_forward  = false;
+      is_backward = false;
+      stopMotors();
+      BTSerial.println("MODE:AUTO");
+      break;
+
+    case 'M':
+      controlSource = SOURCE_BT;
+      is_forward  = false;
+      is_backward = false;
+      BTSerial.println("MODE:MANUAL");
+      break;
+
+    default:
+      BTSerial.println("ERR:UNKNOWN_CMD");
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTO MODE — IR line following + ultrasonic obstacle avoidance
+// ─────────────────────────────────────────────────────────────────────────────
+void runAutoMode() {
+  ir_forward_left_val  = digitalRead(ir_forward_left);
+  ir_forward_right_val = digitalRead(ir_forward_right);
+  ir_backward_left_val  = digitalRead(ir_backward_left);
+  ir_backward_right_val = digitalRead(ir_backward_right);
+
+  if (is_forward && !checkObstacle(forward_us_trigger, forward_us_echo)) {
+    if (ir_forward_left_val == HIGH) {
+      if (ir_forward_right_val == HIGH) {
+        stopMotors();
+      } else {
+        setMotorDirection(BACKWARD, FORWARD);
+      }
+    } else if (ir_forward_right_val == HIGH) {
+      setMotorDirection(FORWARD, BACKWARD);
+    } else {
+      setMotorDirection(FORWARD, FORWARD);
+    }
+  } else if (is_backward && !checkObstacle(backward_us_trigger, backward_us_echo)) {
+    if (ir_backward_left_val == HIGH) {
+      if (ir_backward_right_val == HIGH) {
+        stopMotors();
+      } else {
+        setMotorDirection(FORWARD, BACKWARD);
+      }
+    } else if (ir_backward_right_val == HIGH) {
+      setMotorDirection(BACKWARD, FORWARD);
+    } else {
+      setMotorDirection(BACKWARD, BACKWARD);
+    }
+  } else {
+    stopMotors();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
+void stopMotors() {
+  motor1.run(RELEASE);
+  motor2.run(RELEASE);
+  motor3.run(RELEASE);
+  motor4.run(RELEASE);
+}
+
+void setMotorDirection(int leftDirection, int rightDirection) {
+  motor1.setSpeed(motorSpeed);
+  motor1.run(leftDirection);
+  motor2.setSpeed(motorSpeed);
+  motor2.run(rightDirection);
+  motor3.setSpeed(motorSpeed);
+  motor3.run(leftDirection);
+  motor4.setSpeed(motorSpeed);
+  motor4.run(rightDirection);
+}
+
+long microsecondsToCentimeters(long microseconds) {
+  return microseconds / 29 / 2;
+}
+
+bool checkObstacle(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  long duration = pulseIn(echoPin, HIGH);
+  long cm = microsecondsToCentimeters(duration);
+
+  Serial.print(cm);
+  Serial.println(" cm");
+
+  return cm < 50;
+}
